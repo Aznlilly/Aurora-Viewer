@@ -1046,7 +1046,7 @@ fn probe(@builtin(global_invocation_id) id:vec3<u32>) {{
 
     #[test]
     fn contact_shadows_shader_is_valid() {
-        validate(include_str!("shaders/contact_shadows.wgsl"));
+        validate(&crate::contact_shadows::bend_source());
         validate(include_str!("shaders/contact_shadows_filter.wgsl"));
         // a photo's, up to the most samples
         validate(&crate::contact_shadows::shader_source(192, 13));

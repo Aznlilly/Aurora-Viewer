@@ -30,15 +30,14 @@ use glam::{Mat4, Vec3};
 /// Pixels per wavefront (one workgroup). Must match the shader's.
 pub(crate) const WAVE_SIZE: i32 = 64;
 
-/// Bend's samples per pixel (SampleCount): the shadow's length in pixels
-/// of the window, and HardShadowSamples, the first of them that alone can
-/// shadow the pixel (the last twice as many fade out).
+/// The baseline search and hard samples. Nearby receivers extend the
+/// search to a physical distance; distant receivers retain these samples.
 const SAMPLE_COUNT: f32 = 60.0;
 const HARD_SHADOW_SAMPLES: f32 = 4.0;
 
-/// The most samples per pixel (8 times Bend's), for a photo up to 8 times
-/// taller than the viewfinder's view of it: 9 depth reads per thread, 2.3 KB
-/// of workgroup memory.
+/// Maximum search footprint of the current physical-reach prototype.
+/// Nine shared depth blocks plus conservative 32-sample span bounds.
+/// Longer-range traversal and tiled-photo coverage remain under evaluation.
 pub(crate) const MAX_SAMPLE_COUNT: i32 = 480;
 
 /// The samples per pixel and the hard ones for an image `scale` times
@@ -54,14 +53,21 @@ pub(crate) fn samples(scale: f32) -> (i32, i32) {
 }
 
 /// The shader for `count` samples per pixel, `hard` of them hard
-/// ([`samples`]): Bend's own for 60 and 4, otherwise its constants
-/// rewritten, the last 2 x `hard` fading out and as many depth reads per
-/// thread as the samples need. A constant of the shader rather than of the
+/// ([`samples`]): the baseline constants rewritten for a photo, the last
+/// 2 x `hard` fading out. The adaptive reach shares a fixed maximum footprint. A constant of the shader rather than of the
 /// dispatch: with loops of a count only known when it runs, the window's
 /// pass took 0.84 ms instead of 0.45 (crowd of 40, 2400 x 1350), so the
-/// window keeps Bend's pipeline and a photo gets its own.
+/// window keeps a constant baseline loop and a photo gets its own.
+pub(crate) fn bend_source() -> String {
+    format!(
+        "{}\n{}",
+        include_str!("shaders/contact_shadows.wgsl"),
+        include_str!("shaders/contact_shadows_no_shared.wgsl")
+    )
+}
+
 pub(crate) fn shader_source(count: i32, hard: i32) -> String {
-    let source = include_str!("shaders/contact_shadows.wgsl");
+    let source = bend_source();
     if (count, hard) == (SAMPLE_COUNT as i32, HARD_SHADOW_SAMPLES as i32) {
         return source.to_owned();
     }
@@ -71,11 +77,17 @@ pub(crate) fn shader_source(count: i32, hard: i32) -> String {
         constant("SAMPLE_COUNT", 60, count),
         constant("HARD_SHADOW_SAMPLES", 4, hard),
         constant("FADE_OUT_SAMPLES", 8, (2 * hard).min(count - hard)),
-        constant("READ_COUNT", 2, count / WAVE_SIZE + 2),
+        constant("READ_COUNT", 9, MAX_SAMPLE_COUNT / WAVE_SIZE + 2),
+        constant("BASE_READ_COUNT", 2, count / WAVE_SIZE + 2),
     ] {
         out = out.replacen(&from, &to, 1);
     }
-    out
+    // Full-view correctness reference is for the interactive view. Tiled
+    // photos retain the bounded footprint until cross-tile depth is supplied.
+    out.replace(
+        "const FULL_VIEW_REFERENCE: bool = true;",
+        "const FULL_VIEW_REFERENCE: bool = false;",
+    )
 }
 
 /// How far, in pixels of the image, the contact shadow of a pixel reads the
@@ -86,7 +98,7 @@ pub(crate) fn shader_source(count: i32, hard: i32) -> String {
 /// included).
 pub fn tile_reach(on: bool, scale: f32) -> u32 {
     if Override::from_env().needed(on) {
-        samples(scale).0 as u32 + 1 + 2
+        samples(scale).0.max(MAX_SAMPLE_COUNT) as u32 + 1 + 2
     } else {
         0
     }
@@ -391,7 +403,7 @@ impl Variant {
 /// change to the shader cannot leave a variant silently equal to Bend's
 /// (the tests build every one).
 pub(crate) fn variant_source(variant: Variant) -> String {
-    let bend = include_str!("shaders/contact_shadows.wgsl");
+    let bend = bend_source();
     let lf = || bend.replace("\r\n", "\n");
     let cut = |src: &mut String, from: &str, to: &str, with: &str| {
         let start = src.find(from).unwrap_or_else(|| panic!("contact shadows variant: no `{from}`"));
@@ -406,7 +418,7 @@ pub(crate) fn variant_source(variant: Variant) -> String {
         Variant::Short => shader_source(16, 1),
         Variant::NoEarlyOut => {
             let mut src = lf();
-            cut(&mut src, "    if (workgroupUniformLoad(&any_live) == 0u) {", "    }\n", "");
+            cut(&mut src, "    if (wave_reach == 0u) {", "    }\n", "");
             src
         }
         Variant::NoShared => {
@@ -414,14 +426,46 @@ pub(crate) fn variant_source(variant: Variant) -> String {
             cut(&mut src, "var<workgroup> depth_data", "var<workgroup> any_live: atomic<u32>;\n", "");
             cut(
                 &mut src,
-                "    // ---- early out of a wavefront",
+                "    // ---- the depths along the ray",
                 "    if (skip_pixel) {\n        return;\n    }\n",
-                "    let skip_pixel = sampling_depth[0] >= NEAR_DEPTH || sampling_depth[0] <= FAR_DEPTH;\n    if (skip_pixel) {\n        return;\n    }\n    let wave = Wave(start_xy, end_xy, xy_delta, x_axis_major, reverse_direction, major_axis_start, ma_light_frac, direction, z_sign);\n",
+                "    let direction = -params.light.w;\n    let z_sign = select(1.0, -1.0, NEAR_DEPTH > FAR_DEPTH);\n    let write_xy = vec2<i32>(floor(pixel_xy));\n    let sampling_depth = load_depth(write_xy);\n    let reach = search_reach(vec2<f32>(write_xy) + 0.5, sampling_depth);\n    let skip_pixel = sampling_depth >= NEAR_DEPTH || sampling_depth <= FAR_DEPTH;\n    if (skip_pixel) {\n        return;\n    }\n    let wave = Wave(start_xy, end_xy, xy_delta, x_axis_major, reverse_direction, major_axis_start, ma_light_frac, direction, z_sign);\n",
+            );
+            cut(
+                &mut src,
+                "            // ---- conservative span skip",
+                "            // ---- end span skip",
+                "",
+            );
+            cut(
+                &mut src,
+                "fn depth_delta(",
+                "\n}\n",
+                r#"fn depth_delta(w: ShadowWindow, sample_depth: f32, k: i32) -> f32 {
+    let v = (sample_depth * w.scale - w.start) * -w.z_sign;
+    let distance_k = max(w.distance + f32(k) * w.direction, 1.0);
+    let receding = w.start * f32(k) * w.direction * w.z_sign / distance_k;
+    return max(1.0 - v, v - clamp(receding, 1.0, w.depth));
+}
+"#,
+            );
+            cut(
+                &mut src,
+                "            var delta = abs(1.0 - v);",
+                "            let fade =",
+                r#"            let delta = vec4<f32>(
+                depth_delta(window, sample_depths.x, i + 1), depth_delta(window, sample_depths.y, i + 2),
+                depth_delta(window, sample_depths.z, i + 3), depth_delta(window, sample_depths.w, i + 4));
+            let fade ="#,
             );
             let reads = src.matches("depth_data[sample_index + i]").count();
-            assert_eq!(reads, 3, "contact shadows variant: the shared reads");
+            assert_eq!(reads, 4, "contact shadows variant: the shared reads");
             src = src.replace("depth_data[sample_index + i]", "stored_depth(wave, sample_index + i)");
-            src.push_str(&include_str!("shaders/contact_shadows_no_shared.wgsl").replace("\r\n", "\n"));
+            for lane in 1..=3 {
+                src = src.replace(
+                    &format!("depth_data[sample_index + i + {lane}]"),
+                    &format!("stored_depth(wave, sample_index + i + {lane})"),
+                );
+            }
             src
         }
     }
@@ -434,6 +478,7 @@ struct ParamsU {
     light: [f32; 4],
     wave_offset: [i32; 4],
     tuning: [f32; 4],
+    ray: [f32; 4],
 }
 
 /// The light of the frame as Bend takes it: the direction towards it (w =
@@ -801,6 +846,7 @@ impl ContactShadows {
                 light: self.list.light,
                 wave_offset: [d.wave_offset[0], d.wave_offset[1], 0, 0],
                 tuning: [SURFACE_THICKNESS, BILINEAR_THRESHOLD, SHADOW_CONTRAST, occluder],
+                ray: [light[0] * w as f32 * 0.5, -light[1] * h as f32 * 0.5, light[3], near],
             };
             let at = i * self.stride as usize;
             bytes[at..at + std::mem::size_of::<ParamsU>()].copy_from_slice(bytemuck::bytes_of(&u));
@@ -1022,12 +1068,12 @@ mod tests {
         assert_eq!(samples(8.0), (480, 32));
         assert_eq!(samples(20.0), (MAX_SAMPLE_COUNT, 32));
         // the tiles' guard band covers the samples and the filter
-        assert_eq!(tile_reach(true, 4.0), 243);
+        assert_eq!(tile_reach(true, 4.0), 483);
     }
 
     #[test]
     fn a_photos_shader_rewrites_bends_constants() {
-        let bend = include_str!("shaders/contact_shadows.wgsl");
+        let bend = bend_source();
         assert!(bend.contains(&format!("const WAVE_SIZE: i32 = {WAVE_SIZE};")));
         // the window keeps Bend's shader as it is
         assert_eq!(shader_source(60, 4), bend);
@@ -1036,13 +1082,12 @@ mod tests {
             "const SAMPLE_COUNT: i32 = 240;",
             "const HARD_SHADOW_SAMPLES: i32 = 16;",
             "const FADE_OUT_SAMPLES: i32 = 32;",
-            "const READ_COUNT: i32 = 5;",
+            "const READ_COUNT: i32 = 9;",
+            "const BASE_READ_COUNT: i32 = 5;",
         ] {
             assert!(photo.contains(line), "{line}");
         }
-        for line in ["const SAMPLE_COUNT: i32 = 60;", "const READ_COUNT: i32 = 2;"] {
-            assert!(!photo.contains(line), "{line}");
-        }
+        assert!(!photo.contains("const SAMPLE_COUNT: i32 = 60;"));
     }
 
     #[test]
@@ -1061,16 +1106,16 @@ mod tests {
     /// validity: `contact_shadows_shader_is_valid` in lib.rs).
     #[test]
     fn each_variant_drops_its_construct() {
-        let bend = include_str!("shaders/contact_shadows.wgsl");
+        let bend = bend_source();
         assert_eq!(variant_source(Variant::Bend), bend);
         assert_eq!(variant_source(Variant::Skip), bend);
         let no_exit = variant_source(Variant::NoEarlyOut);
-        assert!(!no_exit.contains("workgroupUniformLoad") && no_exit.contains("workgroupBarrier()"));
+        assert!(!no_exit.contains("if (wave_reach == 0u)") && no_exit.contains("workgroupBarrier()"));
         let no_shared = variant_source(Variant::NoShared);
         for gone in ["var<workgroup>", "workgroupBarrier", "workgroupUniformLoad", "depth_data"] {
             assert!(!no_shared.contains(gone), "{gone}");
         }
-        assert_eq!(no_shared.matches("stored_depth(wave, sample_index + i)").count(), 3);
+        assert_eq!(no_shared.matches("stored_depth(wave, sample_index + i)").count(), 5);
         assert!(variant_source(Variant::Short).contains("const SAMPLE_COUNT: i32 = 16;"));
     }
 
@@ -1085,7 +1130,7 @@ mod tests {
             return;
         };
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).expect("device");
-        let (w, h) = (320u32, 192u32);
+        let (w, h) = (960u32, 192u32);
         let format = wgpu::TextureFormat::Depth32Float;
         let depth_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("test depth"),
@@ -1113,8 +1158,11 @@ mod tests {
                 }
                 @fragment fn fs(@builtin(position) pos: vec4<f32>) -> @builtin(frag_depth) f32 {
                     let ground = 0.0005 * (pos.y + 96.0);
-                    let in_box = pos.x >= 120.0 && pos.x < 170.0 && pos.y >= 90.0 && pos.y < 130.0;
-                    return select(select(ground, ground * 1.02, in_box), 0.0, pos.y < 20.0);
+                    let box = pos.x >= 120.0 && pos.x < 170.0 && pos.y >= 90.0 && pos.y < 130.0;
+                    let wire = pos.x >= 230.0 && pos.x < 231.0 && pos.y >= 50.0 && pos.y < 150.0;
+                    let in_box = box || wire;
+                    let raised = select(ground * 1.02, ground * 1.005, wire);
+                    return select(select(ground, raised, in_box), 0.0, pos.y < 20.0);
                 }"
                 .into(),
             ),
@@ -1169,77 +1217,100 @@ mod tests {
         }
         queue.submit([encoder.finish()]);
         // the sun ahead and high, its point on screen above the image
-        let light = [0.2, 1.6, 0.0, 0.8];
-        let mask = |variant: Variant| -> Vec<u8> {
-            let mut cs = ContactShadows::with_variant(&device, variant);
-            let t = cs.targets(&device, &depth_view, format, w, h);
-            cs.write(&device, &queue, &t, light, 0.1, 1.0);
-            let mut encoder = device.create_command_encoder(&Default::default());
-            cs.encode(&mut encoder, &t, false);
-            let row = (w * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
-            let buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: None,
-                size: (row * h) as u64,
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                mapped_at_creation: false,
-            });
-            encoder.copy_texture_to_buffer(
-                t.raw.texture().as_image_copy(),
-                wgpu::TexelCopyBufferInfo {
-                    buffer: &buffer,
-                    layout: wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(row),
-                        rows_per_image: Some(h),
+        for (light, near) in [
+            ([0.2, 1.6, 0.0, 0.8], 0.1),
+            ([0.2, 1.6, 0.0, 0.8], 0.0001),
+            ([0.6, 0.2, 0.0, -0.6], 0.0001),
+            ([-1.6, 0.0001, 0.0, -0.0001], 0.1),
+        ] {
+            let mask = |variant: Variant| -> Vec<u8> {
+                let mut cs = ContactShadows::with_variant(&device, variant);
+                let t = cs.targets(&device, &depth_view, format, w, h);
+                cs.write(&device, &queue, &t, light, near, 1.0);
+                let mut encoder = device.create_command_encoder(&Default::default());
+                cs.encode(&mut encoder, &t, false);
+                let row = (w * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+                let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: None,
+                    size: (row * h) as u64,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                });
+                encoder.copy_texture_to_buffer(
+                    t.raw.texture().as_image_copy(),
+                    wgpu::TexelCopyBufferInfo {
+                        buffer: &buffer,
+                        layout: wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(row),
+                            rows_per_image: Some(h),
+                        },
                     },
-                },
-                wgpu::Extent3d {
-                    width: w,
-                    height: h,
-                    depth_or_array_layers: 1,
-                },
-            );
-            queue.submit([encoder.finish()]);
-            buffer.slice(..).map_async(wgpu::MapMode::Read, |r| r.expect("map"));
-            device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
-            let data = buffer.slice(..).get_mapped_range().expect("mapped");
-            data.chunks(row as usize)
-                .flat_map(|r| r[..(w * 4) as usize].chunks(4).map(|p| p[0]))
-                .collect()
-        };
-        let bend = mask(Variant::Bend);
-        let shadowed = bend.iter().filter(|&&v| v > 128).count();
-        assert!(shadowed > 50 && shadowed < bend.len() / 2, "a shadow to compare: {shadowed} pixels");
-        // the pixels two wavefronts write (where Bend's dispatches meet) take
-        // whichever lands last: only the others are compared
-        let mut writes = vec![0u8; (w * h) as usize];
-        let list = build_dispatch_list(light, [w as i32, h as i32], [0, 0], [w as i32, h as i32], WAVE_SIZE);
-        written_pixels(&list, WAVE_SIZE, |x, y| {
-            if x >= 0 && y >= 0 && x < w as i32 && y < h as i32 {
-                writes[(y * w as i32 + x) as usize] += 1;
+                    wgpu::Extent3d {
+                        width: w,
+                        height: h,
+                        depth_or_array_layers: 1,
+                    },
+                );
+                queue.submit([encoder.finish()]);
+                buffer.slice(..).map_async(wgpu::MapMode::Read, |r| r.expect("map"));
+                device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+                let data = buffer.slice(..).get_mapped_range().expect("mapped");
+                data.chunks(row as usize)
+                    .flat_map(|r| r[..(w * 4) as usize].chunks(4).map(|p| p[0]))
+                    .collect()
+            };
+            let bend = mask(Variant::Bend);
+            let shadowed = bend.iter().filter(|&&v| v > 128).count();
+            if near == 0.1 {
+                assert!(shadowed > 50 && shadowed < bend.len() / 2, "a shadow to compare: {shadowed} pixels");
             }
-        });
-        let once = writes.iter().filter(|&&n| n == 1).count();
-        assert!(once > writes.len() * 3 / 4, "{once} pixels written once");
-        let differ = |other: &[u8]| -> Vec<(usize, u8, u8)> {
-            bend.iter()
-                .zip(other)
-                .enumerate()
-                .filter(|(i, (a, b))| a != b && writes[*i] == 1)
-                .map(|(i, (a, b))| (i, *a, *b))
-                .collect()
-        };
-        let again = differ(&mask(Variant::Bend));
-        assert!(
-            again.is_empty(),
-            "Bend twice: {} pixels differ, {:?}",
-            again.len(),
-            &again[..again.len().min(8)]
-        );
-        for variant in [Variant::NoEarlyOut, Variant::NoShared] {
-            let d = differ(&mask(variant));
-            assert!(d.is_empty(), "{variant:?}: {} pixels differ, {:?}", d.len(), &d[..d.len().min(8)]);
+            // the pixels two wavefronts write (where Bend's dispatches meet) take
+            // whichever lands last: only the others are compared
+            let mut writes = vec![0u8; (w * h) as usize];
+            let list = build_dispatch_list(light, [w as i32, h as i32], [0, 0], [w as i32, h as i32], WAVE_SIZE);
+            written_pixels(&list, WAVE_SIZE, |x, y| {
+                if x >= 0 && y >= 0 && x < w as i32 && y < h as i32 {
+                    writes[(y * w as i32 + x) as usize] += 1;
+                }
+            });
+            let once = writes.iter().filter(|&&n| n == 1).count();
+            // A light behind the camera has slightly wider dispatch overlaps.
+            let percent = if light[3] > 0.0 { 75 } else { 70 };
+            assert!(once > writes.len() * percent / 100, "{once} pixels written once");
+            let differ = |other: &[u8]| -> Vec<(usize, u8, u8)> {
+                bend.iter()
+                    .zip(other)
+                    .enumerate()
+                    .filter(|(i, (a, b))| a != b && writes[*i] == 1)
+                    .map(|(i, (a, b))| (i, *a, *b))
+                    .collect()
+            };
+            let again = differ(&mask(Variant::Bend));
+            assert!(
+                again.is_empty(),
+                "Bend twice: {} pixels differ, {:?}",
+                again.len(),
+                &again[..again.len().min(8)]
+            );
+            for variant in [Variant::NoEarlyOut, Variant::NoShared] {
+                let d = differ(&mask(variant));
+                assert!(d.is_empty(), "{variant:?}: {} pixels differ, {:?}", d.len(), &d[..d.len().min(8)]);
+            }
+            if light[0] < -1.0 {
+                let bounded = mask(Variant::Short);
+                // A one-pixel wire can darken only one of the four soft
+                // groups (at most 25%); require visible shadow, not full shade.
+                let recovered = (70..130)
+                    .flat_map(|y| (750..900).map(move |x| (y * w + x) as usize))
+                    .filter(|&i| bend[i] > 16 && bounded[i] == 0)
+                    .count();
+                assert!(
+                    recovered > 100,
+                    "full-view search must recover the wire beyond 480 pixels: {recovered}"
+                );
+            }
+            assert!(mask(Variant::Skip).iter().all(|&v| v == 0), "skip: nothing");
         }
-        assert!(mask(Variant::Skip).iter().all(|&v| v == 0), "skip: nothing");
     }
 }

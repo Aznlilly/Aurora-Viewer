@@ -1037,6 +1037,32 @@ when unfocused") is ignored during a screenshot.
   and `zoom` scenarios. The crouch control must remain active throughout
   (`down=true` in the log); add `AURORA_DEMO_LINK=0,firestorm` to exercise
   the crouch-walk through the offline simulator too.
+  `shadow-zoom` holds our avatar in its neutral T-pose through the existing
+  local neutral-pose diagnostic. The camera looks horizontally from the front
+  at the chest joint: 2.4 m from frame 300, 1.2 m from 800, 0.6 m from 1100.
+  Capture at 700,1000,1300 (720,1020,1320 repeat each settled view). The target
+  and direction stay fixed; no mouse pick, orbit, pose animation or breathing
+  affects the comparison. Run with `AURORA_DEMO_SUN=0,60`,
+  `AURORA_GRAPHICS_PRESET=low` (ambient occlusion off), `AURORA_SHADOWS=3`
+  and `AURORA_CONTACT_SHADOWS=1` then `0` to isolate contact self-shadows.
+  Add `AURORA_DEMO_BARS=hidden` to hide the interface and
+  `AURORA_DEMO_RENDER_TEXTURE=1` for world-only captures; panels must not
+  obscure the torso. Do not combine with appearance, movement or other camera scenarios.
+  `shadow-reference` uses the same views and writes posed demo body geometry
+  and camera/light metadata beside `AURORA_CAPTURE` at 700,1000,1300.
+  It exports body parts only, not hair, alpha accessories or world occluders,
+  on a background thread for independent visibility checks.
+  The contact-reach prototype retains contiguous depth samples. Four-sample
+  vector evaluation and conservative bounds over 32-sample ray spans skip
+  work only when the shadow minima cannot change. Run
+  `cargo test --workspace the_variants_that_keep_the_image_draw_bends_mask -- --ignored`
+  for the GPU comparison against a full scalar depth test, including a
+  one-pixel wire, extended searches and lights on both sides of the camera.
+  The interactive full-view correctness reference continues beyond the
+  cooperative 10 cm / 480-pixel prefix to the visible ray endpoint, without
+  an endpoint fade at the prefix. It is intentionally unoptimized. Tiled
+  photographs retain the bounded footprint until cross-tile depth is
+  available. Off-screen or depth-hidden blockers still require shadow maps.
   `zoom-resident` runs People › Near you's Zoom (the double click) on the
   nearest standing resident at frame 600: the camera faces them, 2.5 m away.
   The resident then slides 1.5 m south (660–760) and 1.2 m west (761–860).
